@@ -1,0 +1,16 @@
+# 全部按文本处理，仓库内统一用 LF
+# 这一条很关键：build-ipa.sh 如果在 macOS 上带 CR，bash 会报
+# "pipefail: invalid option" / 找不到解释器，构建直接失败。
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.swift text eol=lf
+*.plist text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+
+*.png binary
+*.ipa binary

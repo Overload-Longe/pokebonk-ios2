@@ -1,0 +1,61 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 40
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          swiftc --version
+          python3 --version
+
+      # 资源带 build hash，提交进仓库一星期就过期；改成构建时按当前首页现场抓，
+      # 站点一换版本，下一次构建自动跟上。
+      - name: 抓取游戏资源
+        run: |
+          python3 tools/fetch_assets.py www
+          echo "--- www 概况 ---"
+          du -sh www
+          find www -type f | wc -l
+          test -f www/index.html || { echo "!! 缺少 www/index.html"; exit 1; }
+          ls -l www/assets/main-*.js
+
+      - name: 生成图标
+        run: python3 make_icons.py
+
+      - name: 编译并打包
+        run: bash build-ipa.sh
+
+      - name: 检查产物结构
+        run: |
+          echo "--- ipa 顶层 ---"
+          unzip -l PokeBonk-unsigned.ipa | head -15
+          echo "--- 关键文件 ---"
+          unzip -l PokeBonk-unsigned.ipa | grep -E "Info.plist|PokeBonk.app/PokeBonk$|www/index.html|www/assets/main-" | head -10
+          echo "--- 二进制架构 ---"
+          rm -rf /tmp/chk && mkdir -p /tmp/chk && cd /tmp/chk
+          unzip -o -q "$GITHUB_WORKSPACE/PokeBonk-unsigned.ipa"
+          file Payload/PokeBonk.app/PokeBonk
+          ls -lh Payload/PokeBonk.app/PokeBonk
+          echo "--- 包内资源数 ---"
+          find Payload/PokeBonk.app/www -type f | wc -l
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokeBonk-unsigned-ipa
+          path: PokeBonk-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

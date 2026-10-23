@@ -1,0 +1,11 @@
+# 构建产物
+build/
+*.ipa
+
+# 构建期生成的东西，不进仓库
+www/
+Resources/*.png
+
+# 杂项
+.DS_Store
+__MACOSX/
