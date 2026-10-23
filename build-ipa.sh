@@ -43,6 +43,11 @@ if [ -d "$ROOT/Resources" ]; then
   cp "$ROOT/Resources"/*.png "$APP/" 2>/dev/null || true
 fi
 cp -R "$ROOT/www" "$APP/www"
+
+# 把仓库里的种子资源（模型 / 精灵图 / UI 等按 ID 动态请求、扫描不到的东西）补进去。
+# 已存在的文件不覆盖：线上当前版本的 core 永远优先。
+python3 "$ROOT/tools/merge_seed.py" "$ROOT/seed" "$APP/www"
+
 find "$APP" -name ".DS_Store" -delete
 find "$APP" -name "__MACOSX" -type d -exec rm -rf {} + 2>/dev/null || true
 

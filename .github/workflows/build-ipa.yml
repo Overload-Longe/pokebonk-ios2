@@ -51,6 +51,15 @@ jobs:
           ls -lh Payload/PokeBonk.app/PokeBonk
           echo "--- 包内资源数 ---"
           find Payload/PokeBonk.app/www -type f | wc -l
+          echo "--- 资源分布（确认种子已合并）---"
+          for d in assets/models assets/pmd assets/ui assets/portraits data; do
+            printf '  %-22s %s\n' "$d" "$(find "Payload/PokeBonk.app/www/$d" -type f 2>/dev/null | wc -l)"
+          done
+          echo "--- 包体积 ---"
+          du -sh Payload/PokeBonk.app
+          # 种子没合并进来就是打包逻辑有问题，直接失败，别产出残缺的包
+          test "$(find Payload/PokeBonk.app/www/assets/models -name '*.glb' 2>/dev/null | wc -l)" -gt 0 \
+            || { echo "!! 没有 3D 模型，seed 合并失败"; exit 1; }
 
       - name: 上传 ipa
         uses: actions/upload-artifact@v4
