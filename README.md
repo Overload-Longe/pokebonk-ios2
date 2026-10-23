@@ -3,8 +3,11 @@
 把 <https://pokebonk.com>（Vite + Three.js 网页游戏）做成 iOS 客户端。
 资源缓存在本地，网络只用来登录和补缺。
 
-> 本仓库只放源码。游戏资源在**构建时**从官网现场抓取，不进仓库
-> （资源名带 build hash，每周都会变，提交进仓库第二天就过期）。
+> 资源分两部分：
+> **core**（`assets/*.js|css`、字体、`data/*.json`）在**构建时**从官网现场抓，不进仓库
+> —— 这些名字带 build hash，每周都会变，提交进仓库第二天就过期；
+> **seed**（模型 / 精灵图 / UI / 音乐等，按 ID 动态请求、名字稳定）随仓库提交，
+> 装完即全本地。
 
 ## 一、怎么出 ipa
 
@@ -82,21 +85,51 @@ App 启动
 单个文件失败只警告；**首页取不到才返回 1**（那时页面根本没法本地化）。
 没抓到的文件客户端会回源代理，所以抓得少不影响能不能玩，只影响加载快不快。
 
+## 四之二、seed/ —— 抓不到的那部分资源
+
+扫描 JS 和 HTML 只能发现 core。但游戏大量资源是**运行时按 ID 拼路径**请求的：
+
+```
+assets/models/<id>.glb      3D 模型（地图、宝可梦）
+assets/pmd/<id>.png         宝可梦像素图
+assets/portraits/<id>.png   立绘
+assets/cries/<id>.ogg       叫声
+assets/ui/ assets/icons/ assets/items/ assets/env/ assets/music/
+```
+
+这些名字里没有 build hash，跨版本基本不变，所以直接随仓库提交。来源是桌面版客户端
+跑一段时间后攒下的 `mirror/`（玩家真正用到过的那些）。刷新方式：
+
+```bash
+python3 tools/sync_seed.py "C:/Users/Longe/Desktop/PokeBonk-Desktop-win64/mirror"
+```
+
+`build-ipa.sh` 在打包前调用 `tools/merge_seed.py` 把 seed 合并进 `www/`，
+规则是**已存在的文件不覆盖** —— 构建期抓到的当前版本 core 永远优先，seed 只补空缺。
+
+> 为什么要这么做：如果只有 core，进游戏后还要按需下载 500 多个文件（十几个 MB），
+> 在慢线路上正是「加载好久」的元凶。带上 seed 后开箱就是 600 个文件 / 17 MB。
+
 ## 五、文件
 
 ```
 Sources/App.swift                本地 HTTP 服务 + WKWebView（全部逻辑，约 420 行）
 Info.plist                       包信息、ATS 放行 127.0.0.1、图标声明、方向
-build-ipa.sh                     swiftc 直接编译 → 手工组装 .app → zip 成 ipa
+build-ipa.sh                     swiftc 直接编译 → 组装 .app → 合并 seed → zip 成 ipa
 make_icons.py                    纯标准库生成 AppIcon（无 Pillow）
-tools/fetch_assets.py            构建期抓取游戏资源
+seed/assets/                     稳定命名的资源（模型/精灵图/UI/音乐），随仓库提交
+tools/fetch_assets.py            构建期抓 core 资源
+tools/merge_seed.py              把 seed 合并进 www（不覆盖已有的 core）
+tools/sync_seed.py               从桌面版 mirror/ 刷新 seed
 .github/workflows/build-ipa.yml  macos-14 上编译并上传 Artifact
 ```
 
 ## 六、已知风险
 
-- **本工程未在真机验证过**。静态检查通过（plist 可解析、括号平衡、资源 0 缺失），
-  但 `swiftc` 在 macos-14 上第一次跑可能出现编译错误，看 Actions 日志逐条修即可。
+- **已编译成功，但未在真机跑过**。2026-10-24 在 `macos-14` 上完整跑通
+  （8 个步骤全绿，产物 11.6 MB / 610 条目），本地拆包校验：二进制为
+  `Mach-O 64-bit arm64`、`Info.plist` 正确、`www` 603 个文件 17.2 MB、
+  glb/ogg/png 文件头抽样正确。真机行为（WebGL、音频、触控）仍需你实测。
 - 音频请求未实现 `Range`，若游戏用 `<audio>` 拖进度可能异常（音乐一般不受影响）。
 - 手机上**必须能访问境外网络**（VPN/代理），否则登录和补资源都会卡住。
 - 图标用 `CFBundleIcons → CFBundleIconFiles` 声明。个别签名工具要求
