@@ -391,8 +391,9 @@ final class MirrorStore {
     ]
 
     private static let maxFileBytes = 12 * 1024 * 1024
-    private static let maxSyncBytes = 24 * 1024 * 1024
-    private static let maxSyncSeconds: TimeInterval = 90
+    private static let maxSyncBytes = 32 * 1024 * 1024
+    /// 手机走代理比桌面慢得多，给足时间再去判定「下不动」，否则总是半途而废
+    private static let maxSyncSeconds: TimeInterval = 150
 
     private init() {
         let root = Bundle.main.resourceURL ?? Bundle.main.bundleURL
@@ -516,7 +517,7 @@ final class MirrorStore {
     private final class Cell { var data: Data? }
 
     private func fetch(_ urlString: String, timeout: TimeInterval, noCache: Bool = false) -> Data? {
-        if netFailStreak >= 4 { return nil }
+        if netFailStreak >= 6 { return nil }
         guard let url = URL(string: urlString) else { return nil }
 
         var req = URLRequest(url: url,
@@ -542,44 +543,163 @@ final class MirrorStore {
         return nil
     }
 
+    // MARK: 分段换版：下载 与 生效 分离
+    //
+    // 游戏中不能直接 reload —— 那会把玩家正在跑的一局当场打断。
+    // 所以运行中的轮询只「备料」：新资源和新首页都下到 overlay，但不动 index.html；
+    // 真正生效留到两个安全时机：
+    //   1. App 冷启动（syncIfNeeded(commit: true)）
+    //   2. 玩家自己点了站点上的「Recargar」（走 applyAndReload）
+
+    private var pendingBuildURL: URL { overlay.appendingPathComponent("_pending.txt") }
+    private var pendingIndexURL: URL { overlay.appendingPathComponent("index.pending.html") }
+
+    private func stagedBuild() -> String? {
+        guard let d = try? Data(contentsOf: pendingBuildURL),
+              let t = String(data: d, encoding: .utf8) else { return nil }
+        let b = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        return b.isEmpty ? nil : b
+    }
+
+    private func stage(_ home: Data, build: String) {
+        put("/index.pending.html", home)
+        put("/_pending.txt", Data(build.utf8))
+    }
+
+    private func dropPending() {
+        try? FileManager.default.removeItem(at: pendingIndexURL)
+        try? FileManager.default.removeItem(at: pendingBuildURL)
+    }
+
+    /// 冷启动时把上一轮备好的那一版切成正式版。返回切过去的 build（没备好就 nil）。
+    /// 先切再查线上：这样即使这次没网，也能进到已经下好的新版。
+    @discardableResult
+    private func applyStaged() -> String? {
+        guard let build = stagedBuild() else { return nil }
+        if build == currentBuild() {
+            dropPending()          // 已经是这一版了，备料没用了
+            return nil
+        }
+        guard let home = try? Data(contentsOf: pendingIndexURL), home.count > 800 else {
+            dropPending()
+            return nil
+        }
+
+        let before = recorded().build
+        put("/index.html", home)
+        dropPending()
+
+        var hist = recorded().history
+        if let old = before, old != build, !hist.contains(old) { hist.append(old) }
+        hist.removeAll { $0 == build }
+        setRecord(build, history: hist)
+        cleanupOldBuilds(current: build, olds: hist)
+
+        NSLog("PokeBonk: 已切到备好的 \(build)")
+        return build
+    }
+
+    /// 纯本地检查：当前 index 及其引用的 chunk 是不是都能读到。不联网，很快。
+    /// 用来发现「index 换了但资源没跟上」的残缺状态 —— 旧逻辑会把它永久锁死在「已是最新」。
+    private func coreComplete() -> Bool {
+        guard let d = data(for: "/index.html"),
+              let html = String(data: d, encoding: .utf8) else { return false }
+        var queue = Self.refsFrom(html)
+        var seen = Set<String>()
+        var round = 0
+        while round < 3 && !queue.isEmpty {
+            var next: [String] = []
+            for rel in queue {
+                if !seen.insert(rel).inserted { continue }
+                guard let f = data(for: rel) else {
+                    NSLog("PokeBonk: core 缺 \(rel)")
+                    return false
+                }
+                if rel.hasSuffix(".js"), let t = String(data: f, encoding: .utf8) {
+                    next.append(contentsOf: Self.refsFrom(t))
+                }
+            }
+            queue = next
+            round += 1
+        }
+        return true
+    }
+
     // MARK: 换版
 
-    /// 启动时对齐版本。真的换版了返回新 build，否则 nil（包括「本来就是最新」和「取不到」）。
+    /// 对齐版本。
+    /// - commit = true：下完就切 index.html（冷启动、玩家主动刷新时用）
+    /// - commit = false：只把资源和新首页备好，不切、不重载（游戏中定时检查用）
+    /// 返回「真的切换生效了」的新 build，否则 nil。
     /// 必须在后台线程调用 —— 里面是同步网络 IO。
-    func syncIfNeeded(progress: ((String) -> Void)? = nil) -> String? {
+    func syncIfNeeded(commit: Bool = true, progress: ((String) -> Void)? = nil) -> String? {
+        netFailStreak = 0
+
+        if commit { _ = applyStaged() }
         let local = currentBuild()
 
         guard let vj = fetch("https://pokebonk.com/version.json", timeout: 10, noCache: true),
               let text = String(data: vj, encoding: .utf8),
               let remote = Self.jsonBuild(text) else { return nil }
 
-        let rec = recorded()
-        if rec.build == nil { setRecord(remote, history: rec.history) }
-        if local == remote { return nil }
+        var rec = recorded()
+        if rec.build == nil {
+            setRecord(remote, history: rec.history)
+            rec = recorded()
+        }
+
+        // 这一版已经备好了就别再备一遍（数据表是强制重下的，白跑流量）
+        if !commit, stagedBuild() == remote {
+            NSLog("PokeBonk: \(remote) 已备好，等下次启动生效")
+            return nil
+        }
+
+        if local == remote {
+            if progress == nil || coreComplete() {
+                return nil
+            }
+            NSLog("PokeBonk: build 记的一致但核心文件不全，重新补齐")
+        }
 
         progress?("发现新版本 \(remote)，正在更新…")
 
         guard let home = fetch("https://pokebonk.com/", timeout: 30, noCache: true),
-              home.count > 800,
-              let html = String(data: home, encoding: .utf8) else { return nil }
+              home.count > 800 else { return nil }
 
-        var queue = Self.bootData + Self.refsFrom(html)
+        var queue = Self.bootData + Self.refsFrom(String(data: home, encoding: .utf8) ?? "")
+        // 数据表名字固定，overlay 里可能留着上一版 —— 换版时必须无条件重下。
+        let force = Set(Self.bootData)
         var wanted = Set<String>()
         var budget = MirrorStore.maxSyncBytes
         let deadline = Date().addingTimeInterval(MirrorStore.maxSyncSeconds)
+        var failed: [String] = []
+        var got = 0
+        // 只有「build 一致但文件残缺」这条自愈路径才顺着本地已有 chunk 找漏；
+        // 换版路径不能这么干，否则会把上一版的 chunk 又拖回来。
+        let healing = (local == remote)
 
         var round = 0
-        while round < 3 && !queue.isEmpty {
+        while round < 4 && !queue.isEmpty {
             var next: [String] = []
             for rel in queue {
                 if !wanted.insert(rel).inserted { continue }
-                if existsInOverlay(rel) { continue }
-                if Date() > deadline || budget <= 0 { break }
+                if !force.contains(rel) && existsInOverlay(rel) {
+                    if healing, rel.hasSuffix(".js"),
+                       let d = data(for: rel), let t = String(data: d, encoding: .utf8) {
+                        next.append(contentsOf: Self.refsFrom(t))
+                    }
+                    continue
+                }
+                if Date() > deadline { failed.append(rel); continue }
+                if budget <= 0 { failed.append(rel); continue }
 
-                guard let d = fetch("https://pokebonk.com" + rel, timeout: 25) else { continue }
+                guard let d = fetch("https://pokebonk.com" + rel, timeout: 25) else {
+                    failed.append(rel)
+                    continue
+                }
                 put(rel, d)
                 budget -= d.count
-
+                got += 1
                 if rel.hasSuffix(".js"), let t = String(data: d, encoding: .utf8) {
                     next.append(contentsOf: Self.refsFrom(t))
                 }
@@ -588,10 +708,28 @@ final class MirrorStore {
             round += 1
         }
 
+        NSLog("PokeBonk: 下到 \(got) 个文件，未拿到 \(failed.count) 个")
+
+        // 资源不齐就不切：半套资源配新首页，站点自带的恢复逻辑会不停重载，
+        // 表现成「一直被提示有新版本、刷新也没用」。老实留在旧版反而没事。
+        guard failed.isEmpty else {
+            NSLog("PokeBonk: 资源不齐，本次不动 index -> \(failed)")
+            progress?("更新未完成，稍后自动重试")
+            return nil
+        }
+
+        if !commit {
+            // 运行中：只备料，绝不碰正在跑的页面
+            stage(home, build: remote)
+            NSLog("PokeBonk: \(remote) 已备好，等下次启动生效")
+            return nil
+        }
+
         // 资源就位了，最后才切首页
         put("/index.html", home)
 
-        var hist = recorded().history
+        rec = recorded()
+        var hist = rec.history
         if let old = rec.build, old != remote, !hist.contains(old) { hist.append(old) }
         hist.removeAll { $0 == remote }
         setRecord(remote, history: hist)
@@ -630,6 +768,8 @@ final class GameViewController: UIViewController, WKNavigationDelegate {
     private var webView: WKWebView!
     private let hint = UILabel()
     private var pollTimer: Timer?
+    /// 本地服务的首页地址（重新加载时要用干净 URL，不能带 ?v=）
+    private var homeURL: URL?
 
     deinit {
         pollTimer?.invalidate()
@@ -676,6 +816,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate {
 
         if let port = LocalServer.shared.start(),
            let url = URL(string: "http://127.0.0.1:\(port)/") {
+            homeURL = url
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let updated = MirrorStore.shared.syncIfNeeded { text in
                     DispatchQueue.main.async { self?.hint.text = text }
@@ -698,7 +839,11 @@ final class GameViewController: UIViewController, WKNavigationDelegate {
 
     // MARK: 版本轮询
 
-    /// 运行中每 3 分钟问一次线上版本：站点发新版时自动更新并重载，不用玩家手动点刷新。
+    /// 运行中每 3 分钟问一次线上版本，但**只备料**：把新资源下到 overlay 就停手。
+    ///
+    /// 不能在这里 reload。站点自己的更新条是避开游戏中的（它判断 e.run），
+    /// 我们无条件重载等于绕过它的保护，玩家会被当场踢出这一局。
+    /// 何时真正换版交给两个安全时机：下次冷启动，或玩家自己点「Recargar」。
     private func startPolling() {
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
@@ -707,20 +852,36 @@ final class GameViewController: UIViewController, WKNavigationDelegate {
     }
 
     private func pollOnce() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let updated = MirrorStore.shared.syncIfNeeded()
-            guard updated != nil else { return }
-            DispatchQueue.main.async { self?.webView?.reload() }
+        DispatchQueue.global(qos: .utility).async {
+            _ = MirrorStore.shared.syncIfNeeded(commit: false)
         }
     }
 
-    /// 站点自带的「刷新」按钮会跳 ?v=&lt;新build&gt;。我们按路径查本地、忽略查询串，
-    /// 放它过去只会再拿到同一份旧 index.html，提示会原地复活 —— 拦下来做一次真正的更新。
+    /// 玩家主动点了刷新（或站点的恢复跳转）：下载 → 立刻切换 → 用干净 URL 重载一次。
+    /// 这里是「人已经决定要更新了」，所以可以打断。
+    private func applyAndReload() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let updated = MirrorStore.shared.syncIfNeeded(commit: true)
+            DispatchQueue.main.async {
+                if let u = updated { NSLog("PokeBonk: 已更新到 \(u)") }
+                guard let self = self else { return }
+                if let home = self.homeURL {
+                    self.webView.load(URLRequest(url: home))
+                } else {
+                    self.webView.reload()
+                }
+            }
+        }
+    }
+
+    /// 站点自带的「刷新」按钮会跳 ?v=&lt;新build&gt;，自带的恢复逻辑会跳 ?pb-reload=。
+    /// 我们按路径查本地、忽略查询串，放它过去只会再拿到同一份旧 index.html，
+    /// 提示会原地复活 —— 拦下来做一次真正的更新。
     private static func isVersionBust(_ url: URL) -> Bool {
         guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else {
             return false
         }
-        return items.contains { $0.name == "v" }
+        return items.contains { $0.name == "v" || $0.name == "pb-reload" }
     }
 
     func webView(_ webView: WKWebView,
@@ -730,7 +891,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate {
            let url = navigationAction.request.url,
            GameViewController.isVersionBust(url) {
             decisionHandler(.cancel)
-            pollOnce()
+            applyAndReload()
             return
         }
         decisionHandler(.allow)
