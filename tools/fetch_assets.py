@@ -38,7 +38,13 @@ RE_ASSETS = re.compile(
     r"([A-Za-z0-9._@%\-]+\.(?:js|css|json|webmanifest|woff2?|ttf))")
 RE_REL = re.compile(r"[\"']\./([A-Za-z0-9._@%\-]+\.(?:js|css))[\"']")
 RE_CSS_URL = re.compile(r"url\(\s*[\"']?\.?/?([A-Za-z0-9._@%\-]+\.(?:woff2?|ttf|png|jpg|svg))[\"']?\s*\)")
-RE_DATA = re.compile(r"[\"'](?:\./)?(data/[A-Za-z0-9._@%\-]+\.json)[\"']")
+# data/ 下允许子目录：国际化文案在 data/i18n/<lang>.json，早期正则只认 data/xxx.json
+RE_DATA = re.compile(r"[\"'](?:\./)?(data/[A-Za-z0-9._@%\-/]+\.json)[\"']")
+
+# 动态 import 出来的 chunk 在 main chunk 里是「裸名」字符串（zh-e36HqkoY-mvmmkftc.js），
+# 既没有 ./ 也没有 assets/ 前缀，上面几条正则都匹配不到 —— 语言包就是这么漏掉的。
+# 这里按当前 build 现场拼正则，只认本版命名的文件，避免误抓同名静态资源。
+RE_CHUNK = re.compile(r"^$")
 
 ALWAYS = ["/", "/version.json", "/favicon.ico", "/manifest.webmanifest"]
 
@@ -89,12 +95,15 @@ def refs_of(text):
         out.add("/assets/" + m.group(1))
     for m in RE_CSS_URL.finditer(text):
         out.add("/assets/" + m.group(1))
+    for m in RE_CHUNK.finditer(text):
+        out.add("/assets/" + m.group(1))
     for m in RE_DATA.finditer(text):
         out.add("/" + m.group(1))
     return out
 
 
 def main():
+    global RE_CHUNK
     root = sys.argv[1] if len(sys.argv) > 1 else "www"
     os.makedirs(root, exist_ok=True)
 
@@ -109,6 +118,16 @@ def main():
     save(root, "/", index)
     total += len(index)
     print("  OK  /  (%d B)" % len(index), flush=True)
+
+    mb = re.search(r'pokebonk-build"\s+content="([^"]+)"', index.decode("utf-8", "ignore"))
+    if mb:
+        # 不锁定引号：语言包是反引号模板字符串（import(`./zh-xxx.js`)），单双引号都会漏。
+        # 名字里不含 /，所以扫描时天然会跳过路径前缀，只取文件名本身。
+        RE_CHUNK = re.compile(
+            r"([A-Za-z0-9._@%\-]+-" + re.escape(mb.group(1)) + r"\.(?:js|css))")
+        print("  当前 build = %s" % mb.group(1), flush=True)
+    else:
+        print("  ! 首页没有 pokebonk-build，跳过裸名 chunk 识别", flush=True)
 
     queue = list(refs_of(index.decode("utf-8", "ignore")))
     seen = set(queue)
