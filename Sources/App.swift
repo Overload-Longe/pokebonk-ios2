@@ -238,12 +238,12 @@ final class LocalServer {
         if rel.isEmpty || rel == "/" { rel = "/index.html" }
         if rel.contains("..") { return nil }
 
-        let fileURL = www.appendingPathComponent(String(rel.dropFirst()))
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        guard var data = try? Data(contentsOf: fileURL) else { return nil }
+        // overlay（更新下来的）优先，其次包内 www
+        guard var data = MirrorStore.shared.data(for: rel) else { return nil }
 
-        let mime = mimeType(for: fileURL.pathExtension)
-        // 只有 JS 里才可能出现 API 域名；CSS/JSON 不必解码，省掉每帧几百 KB 的字符串开销
+        let mime = mimeType(for: (rel as NSString).pathExtension)
+        // 只有 JS 里才可能出现 API 域名；CSS/JSON 不必解码，省掉每帧几百 KB 的字符串开销。
+        // 更新到 overlay 的 JS 同样要替换 —— 否则换了新版本，API 还指着公网域名。
         if mime.contains("javascript") {
             data = patchAPI(data, key: rel)
         }
@@ -357,11 +357,278 @@ final class LocalServer {
     }
 }
 
+// MARK: - 可写镜像层
+//
+// 装进 ipa 的 www/ 是只读的，官网一发新版就会永远停在旧版本。
+// 所以在 Application Support 里再放一层可写的 overlay，读取顺序：
+//     overlay（更新下来的） → 包内 www（打包时带的） → 交回网络反代
+//
+// 换版流程和桌面版/安卓版一致：
+//   取 version.json 比对 build → 先把数据表和 core 资源下到 overlay
+//   → 最后才切 index.html（反了会白屏重载）→ 记历史并清掉 overlay 里的旧版文件
+
+final class MirrorStore {
+
+    static let shared = MirrorStore()
+
+    private let bundled: URL
+    let overlay: URL
+
+    private var netFailStreak = 0
+
+    /// 名字固定、必须跟着版本一起换的数据表（旧数据表配新代码会出错）
+    private static let bootData = [
+        "/data/types.json", "/data/items.json", "/data/abilities.json",
+        "/data/pokemon.json", "/data/sprites.json", "/data/moves.json",
+        "/data/learnsets.json", "/data/i18n/zh.json",
+    ]
+
+    /// 文件名跨版本不变的目录：命中就用，但换版后允许后台换新
+    private static let stablePrefixes = [
+        "/assets/models/", "/assets/pmd/", "/assets/portraits/", "/assets/items/",
+        "/assets/icons/", "/assets/ui/", "/assets/env/", "/assets/cries/",
+        "/assets/music/", "/data/",
+    ]
+
+    private static let maxFileBytes = 12 * 1024 * 1024
+    private static let maxSyncBytes = 24 * 1024 * 1024
+    private static let maxSyncSeconds: TimeInterval = 90
+
+    private init() {
+        let root = Bundle.main.resourceURL ?? Bundle.main.bundleURL
+        bundled = root.appendingPathComponent("www", isDirectory: true)
+
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        overlay = support.appendingPathComponent("mirror", isDirectory: true)
+        try? FileManager.default.createDirectory(at: overlay, withIntermediateDirectories: true)
+    }
+
+    static func isStable(_ path: String) -> Bool {
+        for p in stablePrefixes where path.hasPrefix(p) { return true }
+        return false
+    }
+
+    // MARK: 读
+
+    func data(for rel: String) -> Data? {
+        let clean = rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
+        let f = overlay.appendingPathComponent(clean)
+        if let d = try? Data(contentsOf: f), !d.isEmpty { return d }
+        let b = bundled.appendingPathComponent(clean)
+        return try? Data(contentsOf: b)
+    }
+
+    private func existsInOverlay(_ rel: String) -> Bool {
+        let clean = rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
+        return FileManager.default.fileExists(atPath: overlay.appendingPathComponent(clean).path)
+    }
+
+    func currentBuild() -> String? {
+        guard let d = data(for: "/index.html"), let html = String(data: d, encoding: .utf8) else { return nil }
+        return Self.buildTag(html)
+    }
+
+    static func buildTag(_ html: String) -> String? {
+        guard let k = html.range(of: "pokebonk-build") else { return nil }
+        guard let c = html.range(of: "content=\"", range: k.upperBound..<html.endIndex) else { return nil }
+        let rest = html[c.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[rest.startIndex..<end])
+    }
+
+    private static func jsonBuild(_ text: String) -> String? {
+        guard let k = text.range(of: "\"build\"") else { return nil }
+        guard let c = text.range(of: "\"", range: k.upperBound..<text.endIndex) else { return nil }
+        let rest = text[c.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        let v = String(rest[rest.startIndex..<end])
+        return v.isEmpty ? nil : v
+    }
+
+    private static func refsFrom(_ text: String) -> [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+
+        func add(_ s: String) {
+            if seen.insert(s).inserted { out.append(s) }
+        }
+
+        if let rx = try? NSRegularExpression(
+            pattern: "(?:\\./|/)?assets/([A-Za-z0-9._@%\\-]+\\.(?:js|css|json|webmanifest|woff2))") {
+            let ns = text as NSString
+            for m in rx.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
+                if m.numberOfRanges > 1 { add("/assets/" + ns.substring(with: m.range(at: 1))) }
+            }
+        }
+        if let rx2 = try? NSRegularExpression(
+            pattern: "\"\\./([A-Za-z0-9._@%\\-]+\\.(?:js|css))\"") {
+            let ns = text as NSString
+            for m in rx2.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
+                if m.numberOfRanges > 1 { add("/assets/" + ns.substring(with: m.range(at: 1))) }
+            }
+        }
+        return out
+    }
+
+    // MARK: 写
+
+    private func put(_ rel: String, _ data: Data) {
+        let clean = rel.hasPrefix("/") ? String(rel.dropFirst()) : rel
+        let f = overlay.appendingPathComponent(clean)
+        let dir = f.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let tmp = dir.appendingPathComponent(f.lastPathComponent + ".part")
+        do {
+            try data.write(to: tmp, options: .atomic)
+            _ = try? FileManager.default.removeItem(at: f)
+            try FileManager.default.moveItem(at: tmp, to: f)
+        } catch { }
+    }
+
+    // MARK: build 记录（overlay/_build.txt，内容 "build|历史,历史"）
+
+    private var recordURL: URL { overlay.appendingPathComponent("_build.txt") }
+
+    private func recorded() -> (build: String?, history: [String]) {
+        guard let d = try? Data(contentsOf: recordURL),
+              let t = String(data: d, encoding: .utf8) else { return (nil, []) }
+        let parts = t.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        let b = parts.isEmpty ? "" : String(parts[0]).trimmingCharacters(in: .whitespaces)
+        var hist: [String] = []
+        if parts.count > 1 {
+            for p in String(parts[1]).split(separator: ",") {
+                let s = p.trimmingCharacters(in: .whitespaces)
+                if !s.isEmpty && !hist.contains(s) { hist.append(s) }
+            }
+        }
+        return (b.isEmpty ? nil : b, hist)
+    }
+
+    private func setRecord(_ build: String, history: [String]) {
+        let keep = history.suffix(8).joined(separator: ",")
+        put("/_build.txt", Data("\(build)|\(keep)".utf8))
+    }
+
+    // MARK: 网络
+
+    /// 用引用类型接 URLSession 的结果，避免在并发闭包里改捕获的 var（Swift 6 会报错）
+    private final class Cell { var data: Data? }
+
+    private func fetch(_ urlString: String, timeout: TimeInterval, noCache: Bool = false) -> Data? {
+        if netFailStreak >= 4 { return nil }
+        guard let url = URL(string: urlString) else { return nil }
+
+        var req = URLRequest(url: url,
+                             cachePolicy: noCache ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy,
+                             timeoutInterval: timeout)
+        req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                     + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                     forHTTPHeaderField: "User-Agent")
+
+        let cell = Cell()
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { cell.data = data }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + timeout + 8)
+
+        if let d = cell.data {
+            netFailStreak = 0
+            return d.count > MirrorStore.maxFileBytes ? nil : d
+        }
+        netFailStreak += 1
+        return nil
+    }
+
+    // MARK: 换版
+
+    /// 启动时对齐版本。真的换版了返回新 build，否则 nil（包括「本来就是最新」和「取不到」）。
+    /// 必须在后台线程调用 —— 里面是同步网络 IO。
+    func syncIfNeeded(progress: ((String) -> Void)? = nil) -> String? {
+        let local = currentBuild()
+
+        guard let vj = fetch("https://pokebonk.com/version.json", timeout: 10, noCache: true),
+              let text = String(data: vj, encoding: .utf8),
+              let remote = Self.jsonBuild(text) else { return nil }
+
+        let rec = recorded()
+        if rec.build == nil { setRecord(remote, history: rec.history) }
+        if local == remote { return nil }
+
+        progress?("发现新版本 \(remote)，正在更新…")
+
+        guard let home = fetch("https://pokebonk.com/", timeout: 30, noCache: true),
+              home.count > 800,
+              let html = String(data: home, encoding: .utf8) else { return nil }
+
+        var queue = Self.bootData + Self.refsFrom(html)
+        var wanted = Set<String>()
+        var budget = MirrorStore.maxSyncBytes
+        let deadline = Date().addingTimeInterval(MirrorStore.maxSyncSeconds)
+
+        var round = 0
+        while round < 3 && !queue.isEmpty {
+            var next: [String] = []
+            for rel in queue {
+                if !wanted.insert(rel).inserted { continue }
+                if existsInOverlay(rel) { continue }
+                if Date() > deadline || budget <= 0 { break }
+
+                guard let d = fetch("https://pokebonk.com" + rel, timeout: 25) else { continue }
+                put(rel, d)
+                budget -= d.count
+
+                if rel.hasSuffix(".js"), let t = String(data: d, encoding: .utf8) {
+                    next.append(contentsOf: Self.refsFrom(t))
+                }
+            }
+            queue = next
+            round += 1
+        }
+
+        // 资源就位了，最后才切首页
+        put("/index.html", home)
+
+        var hist = recorded().history
+        if let old = rec.build, old != remote, !hist.contains(old) { hist.append(old) }
+        hist.removeAll { $0 == remote }
+        setRecord(remote, history: hist)
+        cleanupOldBuilds(current: remote, olds: hist)
+
+        return remote
+    }
+
+    private func cleanupOldBuilds(current: String, olds: [String]) {
+        guard !olds.isEmpty else { return }
+        let dir = overlay.appendingPathComponent("assets", isDirectory: true)
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir,
+                                                                     includingPropertiesForKeys: nil) else { return }
+        guard let rx = try? NSRegularExpression(pattern: "-(?<tag>[a-z0-9]{8})\\.(?:js|css|woff2)$",
+                                               options: [.caseInsensitive]) else { return }
+
+        for f in files {
+            let name = f.lastPathComponent
+            let ns = name as NSString
+            guard let m = rx.firstMatch(in: name, options: [], range: NSRange(location: 0, length: ns.length)),
+                  let r = Range(m.range(withName: "tag"), in: name) else { continue }
+            let tag = String(name[r])
+            if tag.lowercased() == current.lowercased() { continue }
+            // 只删历史里确实记录过的 build，别按「像 8 位 hash」乱删（three-xxxx.js 会被误伤）
+            if olds.contains(where: { $0.lowercased() == tag.lowercased() }) {
+                try? FileManager.default.removeItem(at: f)
+            }
+        }
+    }
+}
+
 // MARK: - 界面
 
 final class GameViewController: UIViewController {
 
     private var webView: WKWebView!
+    private let hint = UILabel()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -386,11 +653,38 @@ final class GameViewController: UIViewController {
         view.addSubview(wv)
         webView = wv
 
+        // 检查版本 / 更新资源时的一句话提示（新版本首页配旧资源会白屏重载，所以先对齐再进）
+        hint.text = "正在检查版本…"
+        hint.textColor = UIColor(white: 0.78, alpha: 1)
+        hint.font = UIFont.systemFont(ofSize: 13)
+        hint.numberOfLines = 0
+        hint.textAlignment = .center
+        hint.backgroundColor = UIColor(white: 0.06, alpha: 0.9)
+        hint.layer.cornerRadius = 8
+        hint.clipsToBounds = true
+        hint.sizeToFit()
+        hint.frame = CGRect(x: 16, y: 40,
+                            width: view.bounds.width - 32, height: 34)
+        hint.autoresizingMask = [.flexibleWidth]
+        view.addSubview(hint)
+
         if let port = LocalServer.shared.start(),
            let url = URL(string: "http://127.0.0.1:\(port)/") {
-            wv.load(URLRequest(url: url))
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let updated = MirrorStore.shared.syncIfNeeded { text in
+                    DispatchQueue.main.async { self?.hint.text = text }
+                }
+                DispatchQueue.main.async {
+                    self?.hint.isHidden = true
+                    wv.load(URLRequest(url: url))
+                    if let u = updated {
+                        NSLog("PokeBonk: 已更新到 \(u)")
+                    }
+                }
+            }
         } else {
             // 本地服务起不来就直连官网：没有加速，但至少能玩
+            hint.isHidden = true
             wv.load(URLRequest(url: URL(string: "https://pokebonk.com/")!))
         }
     }
