@@ -18,7 +18,7 @@ macos-14 runner 上跑完约 3~5 分钟，在 Actions 运行详情页底部 **Ar
 本地也可以手动跑（需要 macOS + Xcode / CLT）：
 
 ```bash
-python3 tools/fetch_assets.py www   # 抓资源（约 5 MB / 46 个文件）
+python3 tools/fetch_assets.py www   # 抓 core（约 11 MB / 62 个文件，含 8 种语言）
 python3 make_icons.py               # 生成图标
 bash build-ipa.sh                   # 出 PokeBonk-unsigned.ipa
 ```
@@ -78,8 +78,10 @@ App 启动
 
 1. 取首页 `index.html` + `version.json` + `favicon.ico` + `manifest.webmanifest`
 2. 从首页出发按依赖图广度优先展开：`assets/*.js|css` → chunk 内部 `"./xxx.js"` → CSS 里的字体
-3. 补上 JS 里硬编码的 `data/*.json`（宝可梦、招式、道具等数据表）
-4. 上限：6 层、260 个文件、40 MB；字体只留 20 个（按 unicode-range 切片有上千个，
+3. 补上 JS 里硬编码的 `data/*.json`，含子目录的 `data/i18n/<lang>.json`（8 种语言）
+4. 识别**裸名动态 chunk**：语言界面包是 `` import(`./zh-<hash>-<build>.js`) `` 这种反引号
+   模板字符串，既没有 `./` 也没有 `assets/` 前缀，按当前 build 号单独匹配
+5. 上限：6 层、260 个文件、40 MB；字体只留 20 个（按 unicode-range 切片有上千个，
    运行时用到的极少，其余回源）
 
 单个文件失败只警告；**首页取不到才返回 1**（那时页面根本没法本地化）。
@@ -107,7 +109,11 @@ python3 tools/sync_seed.py "C:/Users/Longe/Desktop/PokeBonk-Desktop-win64/mirror
 规则是**已存在的文件不覆盖** —— 构建期抓到的当前版本 core 永远优先，seed 只补空缺。
 
 > 为什么要这么做：如果只有 core，进游戏后还要按需下载 500 多个文件（十几个 MB），
-> 在慢线路上正是「加载好久」的元凶。带上 seed 后开箱就是 600 个文件 / 17 MB。
+> 在慢线路上正是「加载好久」的元凶。带上 seed 后开箱就是 999 个文件 / 29 MB，
+> 与 Android 端（1000 个文件）基本一致，剩下差异只是字体切片组合。
+>
+> 明确**不收录 `coop/`**：那是站点 0.8.34 时期的联机子应用快照，265 个文件一直没跟着
+> 更新，留着既占体积又可能让客户端加载到版本不匹配的素材。
 
 ## 四之三、官网发新版会自动更新吗
 
