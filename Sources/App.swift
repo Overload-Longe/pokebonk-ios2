@@ -625,10 +625,15 @@ final class MirrorStore {
 
 // MARK: - 界面
 
-final class GameViewController: UIViewController {
+final class GameViewController: UIViewController, WKNavigationDelegate {
 
     private var webView: WKWebView!
     private let hint = UILabel()
+    private var pollTimer: Timer?
+
+    deinit {
+        pollTimer?.invalidate()
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -652,6 +657,7 @@ final class GameViewController: UIViewController {
         }
         view.addSubview(wv)
         webView = wv
+        wv.navigationDelegate = self
 
         // 检查版本 / 更新资源时的一句话提示（新版本首页配旧资源会白屏重载，所以先对齐再进）
         hint.text = "正在检查版本…"
@@ -680,6 +686,7 @@ final class GameViewController: UIViewController {
                     if let u = updated {
                         NSLog("PokeBonk: 已更新到 \(u)")
                     }
+                    self?.startPolling()
                 }
             }
         } else {
@@ -687,6 +694,46 @@ final class GameViewController: UIViewController {
             hint.isHidden = true
             wv.load(URLRequest(url: URL(string: "https://pokebonk.com/")!))
         }
+    }
+
+    // MARK: 版本轮询
+
+    /// 运行中每 3 分钟问一次线上版本：站点发新版时自动更新并重载，不用玩家手动点刷新。
+    private func startPolling() {
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
+            self?.pollOnce()
+        }
+    }
+
+    private func pollOnce() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let updated = MirrorStore.shared.syncIfNeeded()
+            guard updated != nil else { return }
+            DispatchQueue.main.async { self?.webView?.reload() }
+        }
+    }
+
+    /// 站点自带的「刷新」按钮会跳 ?v=&lt;新build&gt;。我们按路径查本地、忽略查询串，
+    /// 放它过去只会再拿到同一份旧 index.html，提示会原地复活 —— 拦下来做一次真正的更新。
+    private static func isVersionBust(_ url: URL) -> Bool {
+        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else {
+            return false
+        }
+        return items.contains { $0.name == "v" }
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if navigationAction.targetFrame?.isMainFrame == true,
+           let url = navigationAction.request.url,
+           GameViewController.isVersionBust(url) {
+            decisionHandler(.cancel)
+            pollOnce()
+            return
+        }
+        decisionHandler(.allow)
     }
 
     override var prefersStatusBarHidden: Bool { true }
